@@ -1,0 +1,11 @@
+pvporcupine
+sounddevice
+pyttsx3
+gpiozero
+RPi.GPIO
+requests
+python-dotenv
+SpeechRecognition
+supabase
+
+
