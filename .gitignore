@@ -1,0 +1,7 @@
+.env
+pycache/
+*.pyc
+*.pyo
+.DS_Store
+*.log
+models/
