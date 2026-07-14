@@ -5,3 +5,5 @@ pycache/
 .DS_Store
 *.log
 models/
+venv/
+
