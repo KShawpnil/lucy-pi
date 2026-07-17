@@ -2,17 +2,50 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 from pathlib import Path
 from typing import Any, Callable
 
 from dotenv import load_dotenv
+from postgrest.exceptions import APIError
 from supabase import Client, create_client
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 _client: Client | None = None
+
+
+def _env(name: str) -> str:
+    return (os.getenv(name) or "").strip()
+
+
+def _jwt_role(api_key: str) -> str | None:
+    try:
+        payload = api_key.split(".")[1]
+        padded = payload + "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded))
+        return data.get("role")
+    except (IndexError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _resolve_credentials() -> tuple[str, str]:
+    url = (
+        _env("SUPABASE_URL")
+        or _env("VITE_SUPABASE_URL")
+        or _env("NEXT_PUBLIC_SUPABASE_URL")
+    )
+    # Pi/backend should use the service role key so RLS does not return zero rows.
+    key = (
+        _env("SUPABASE_SERVICE_ROLE_KEY")
+        or _env("SUPABASE_KEY")
+        or _env("SUPABASE_ANON_KEY")
+        or _env("VITE_SUPABASE_ANON_KEY")
+    )
+    return url, key
 
 
 def get_client() -> Client:
@@ -21,15 +54,24 @@ def get_client() -> Client:
     if _client is not None:
         return _client
 
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_KEY")
+    url, key = _resolve_credentials()
     if not url or not key:
         raise RuntimeError(
-            "SUPABASE_URL and SUPABASE_KEY must be set in the project .env file"
+            "Set SUPABASE_URL and SUPABASE_KEY (service role recommended on the Pi) "
+            f"in {_PROJECT_ROOT / '.env'}"
         )
 
     _client = create_client(url, key)
     return _client
+
+
+def describe_connection() -> dict[str, str | None]:
+    """URL and JWT role (anon vs service_role) for the configured API key."""
+    url, key = _resolve_credentials()
+    return {
+        "url": url or None,
+        "key_role": _jwt_role(key) if key else None,
+    }
 
 
 def _apply_eq_filters(query: Any, filters: dict[str, Any] | None) -> Any:
@@ -43,6 +85,13 @@ def _apply_eq_filters(query: Any, filters: dict[str, Any] | None) -> Any:
 def _response_data(response: Any) -> list[dict[str, Any]]:
     data = getattr(response, "data", None)
     return data if isinstance(data, list) else []
+
+
+def _run_select(query: Any) -> Any:
+    try:
+        return query.execute()
+    except APIError as exc:
+        raise RuntimeError(f"Supabase query failed: {exc}") from exc
 
 
 def insert_record(
@@ -70,8 +119,21 @@ def read_records(
         query = query.order(order_by, desc=descending)
     if limit is not None:
         query = query.limit(limit)
-    response = query.execute()
+    response = _run_select(query)
     return _response_data(response)
+
+
+def count_records(
+    table: str,
+    *,
+    filters: dict[str, Any] | None = None,
+) -> int:
+    """Return row count for `table` (respects RLS for the configured API key)."""
+    query = get_client().table(table).select("*", count="exact")
+    query = _apply_eq_filters(query, filters)
+    response = _run_select(query.limit(0))
+    count = getattr(response, "count", None)
+    return int(count) if count is not None else 0
 
 
 def update_record(
