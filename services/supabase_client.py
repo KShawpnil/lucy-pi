@@ -57,7 +57,7 @@ def get_client() -> Client:
     url, key = _resolve_credentials()
     if not url or not key:
         raise RuntimeError(
-            "Set SUPABASE_URL and SUPABASE_KEY (service role recommended on the Pi) "
+            "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (service role recommended on the Pi) "
             f"in {_PROJECT_ROOT / '.env'}"
         )
 
