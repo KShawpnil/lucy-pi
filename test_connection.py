@@ -1,10 +1,10 @@
 """Smoke test: Supabase connection and patients table read."""
 
-from services import backend
+from services import supabase_client
 
 
 def main() -> None:
-    rows = backend.read_records("patients", limit=1)
+    rows = supabase_client.read_records("patients", limit=1)
     if not rows:
         print("No rows in patients table.")
         return
