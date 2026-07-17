@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import sounddevice as sd
 from dotenv import load_dotenv
-from daily import CallClient, Daily
+from daily import CallClient, Daily, EventHandler
 from picamera2 import Picamera2
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -28,7 +28,8 @@ VIDEO_COLOR_FORMAT = "RGB"
 
 # Daily virtual microphone (fed from reSpeaker via sounddevice)
 MIC_DEVICE_NAME = "lucy-respeaker"
-MIC_SAMPLE_RATE = 48000
+MIC_SAMPLE_RATE = 16000  # reSpeaker XVF3800 native rate
+MIC_SAMPLE_RATE_FALLBACKS = (16000, 44100, 48000)
 MIC_CHANNELS = 1
 MIC_BLOCK_MS = 20
 
@@ -66,6 +67,34 @@ def _default_output_device() -> int | None:
         return None
 
 
+def _participant_id(participant: Any) -> str | None:
+    if isinstance(participant, dict):
+        return participant.get("id") or participant.get("session_id")
+    return getattr(participant, "id", None) or getattr(participant, "session_id", None)
+
+
+def _is_local_participant(participant: Any) -> bool:
+    if isinstance(participant, dict):
+        return bool(participant.get("local"))
+    return bool(getattr(participant, "local", False))
+
+
+class _CallEventHandler(EventHandler):
+    """Attach remote audio renderers when participants join (no wildcard IDs)."""
+
+    def __init__(self, manager: "CameraManager") -> None:
+        super().__init__()
+        self._manager = manager
+
+    def on_participant_joined(self, participant: Any) -> None:
+        if _is_local_participant(participant):
+            self._manager._local_participant_id = _participant_id(participant)
+            return
+        participant_id = _participant_id(participant)
+        if participant_id:
+            self._manager._attach_remote_audio_renderer(participant_id)
+
+
 class CameraManager:
     """Manage Daily video calls with Picamera2 video and USB/HAT audio."""
 
@@ -83,6 +112,33 @@ class CameraManager:
         self._output_stream: sd.OutputStream | None = None
         self._respeaker_device: int | None = None
         self._output_device: int | None = None
+        self._mic_sample_rate: int = MIC_SAMPLE_RATE
+        self._local_participant_id: str | None = None
+        self._audio_renderer_participants: set[str] = set()
+        self._on_remote_audio: Any = None
+
+    def _resolve_mic_sample_rate(self) -> int:
+        """Pick the first supported input sample rate (16 kHz preferred for reSpeaker)."""
+        last_error: Exception | None = None
+        for rate in MIC_SAMPLE_RATE_FALLBACKS:
+            try:
+                sd.check_input_settings(
+                    device=self._respeaker_device,
+                    samplerate=rate,
+                    channels=MIC_CHANNELS,
+                )
+                if rate != MIC_SAMPLE_RATE:
+                    print(
+                        f"Lucy Pi: mic using fallback sample rate {rate} Hz "
+                        f"({MIC_SAMPLE_RATE} Hz unavailable)."
+                    )
+                return rate
+            except Exception as exc:
+                last_error = exc
+                print(f"Lucy Pi: mic sample rate {rate} Hz failed — {exc}")
+        raise RuntimeError(
+            "Could not configure reSpeaker microphone at 16000, 44100, or 48000 Hz"
+        ) from last_error
 
     def join_video_call(self, room_url: str) -> None:
         if self.is_call_active:
@@ -92,6 +148,7 @@ class CameraManager:
 
         self._respeaker_device = _find_respeaker_input_device()
         self._output_device = _default_output_device()
+        self._mic_sample_rate = self._resolve_mic_sample_rate()
 
         self._start_picamera()
         self._virtual_camera = Daily.create_camera_device(
@@ -102,12 +159,12 @@ class CameraManager:
         )
         self._virtual_microphone = Daily.create_microphone_device(
             MIC_DEVICE_NAME,
-            sample_rate=MIC_SAMPLE_RATE,
+            sample_rate=self._mic_sample_rate,
             channels=MIC_CHANNELS,
             non_blocking=True,
         )
 
-        client = CallClient()
+        client = CallClient(event_handler=_CallEventHandler(self))
         self.current_call_client = client
 
         client.join(
@@ -130,7 +187,8 @@ class CameraManager:
             },
         )
 
-        self._start_remote_audio_playback(client)
+        self._start_remote_audio_playback()
+        self._register_existing_remote_participants(client)
         self._stop_event.clear()
         self._video_thread = threading.Thread(
             target=self._stream_picamera_frames,
@@ -159,7 +217,7 @@ class CameraManager:
         print(
             f"Lucy Pi: joined video call at {room_url}\n"
             f"  Video: Picamera2 → {CAMERA_DEVICE_NAME} ({VIDEO_WIDTH}x{VIDEO_HEIGHT})\n"
-            f"  Audio in: {mic_label}\n"
+            f"  Audio in: {mic_label} @ {self._mic_sample_rate} Hz\n"
             f"  Audio out: {out_label}"
         )
 
@@ -191,6 +249,9 @@ class CameraManager:
         self.current_call_client = None
         self._virtual_camera = None
         self._virtual_microphone = None
+        self._local_participant_id = None
+        self._audio_renderer_participants.clear()
+        self._on_remote_audio = None
 
         print("Lucy Pi: video call ended cleanly.")
 
@@ -231,13 +292,13 @@ class CameraManager:
             time.sleep(frame_interval)
 
     def _stream_respeaker_audio(self) -> None:
-        block_frames = int(MIC_SAMPLE_RATE * MIC_BLOCK_MS / 1000)
+        block_frames = int(self._mic_sample_rate * MIC_BLOCK_MS / 1000)
         if self._virtual_microphone is None:
             return
 
         try:
             with sd.RawInputStream(
-                samplerate=MIC_SAMPLE_RATE,
+                samplerate=self._mic_sample_rate,
                 channels=MIC_CHANNELS,
                 dtype="int16",
                 blocksize=block_frames,
@@ -250,10 +311,51 @@ class CameraManager:
             if not self._stop_event.is_set():
                 print(f"Lucy Pi: microphone stream error — {exc}")
 
-    def _start_remote_audio_playback(self, client: CallClient) -> None:
-        """Play remote call audio on the default output (InnoMaker HAT)."""
+    def _register_existing_remote_participants(self, client: CallClient) -> None:
+        """Attach audio renderers for participants already in the room."""
+        try:
+            participants = client.participants()
+        except Exception as exc:
+            print(f"Lucy Pi: could not list participants — {exc}")
+            return
 
-        def on_remote_audio(participant_id: str, audio_data: Any, audio_source: str) -> None:
+        for participant_id, info in participants.items():
+            if isinstance(info, dict) and info.get("local"):
+                self._local_participant_id = participant_id
+                continue
+            self._attach_remote_audio_renderer(str(participant_id))
+
+    def _attach_remote_audio_renderer(self, participant_id: str) -> None:
+        """Register Daily audio output for one remote participant (never wildcard)."""
+        if (
+            self.current_call_client is None
+            or participant_id in self._audio_renderer_participants
+            or participant_id == self._local_participant_id
+            or self._on_remote_audio is None
+        ):
+            return
+
+        try:
+            self.current_call_client.set_audio_renderer(
+                participant_id,
+                self._on_remote_audio,
+                audio_source="microphone",
+                sample_rate=self._mic_sample_rate,
+            )
+            self._audio_renderer_participants.add(participant_id)
+            print(f"Lucy Pi: receiving audio from participant {participant_id}.")
+        except Exception as exc:
+            print(
+                f"Lucy Pi: could not attach audio renderer for "
+                f"participant {participant_id} — {exc}"
+            )
+
+    def _start_remote_audio_playback(self) -> None:
+        """Prepare speaker output; renderers are attached per remote participant ID."""
+
+        def on_remote_audio(
+            participant_id: str, audio_data: Any, audio_source: str
+        ) -> None:
             if self._stop_event.is_set() or self._output_stream is None:
                 return
             try:
@@ -264,20 +366,15 @@ class CameraManager:
             except Exception as exc:
                 print(f"Lucy Pi: remote audio playback error — {exc}")
 
+        self._on_remote_audio = on_remote_audio
+
         self._output_stream = sd.OutputStream(
-            samplerate=MIC_SAMPLE_RATE,
+            samplerate=self._mic_sample_rate,
             channels=MIC_CHANNELS,
             dtype="int16",
             device=self._output_device,
         )
         self._output_stream.start()
-
-        client.set_audio_renderer(
-            "*",
-            on_remote_audio,
-            audio_source="microphone",
-            sample_rate=MIC_SAMPLE_RATE,
-        )
 
 
     def _stop_remote_audio_playback(self) -> None:
