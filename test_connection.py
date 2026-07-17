@@ -1,15 +1,11 @@
-"""Smoke test: Supabase connection and patients table read."""
+"""Quick Supabase connectivity check: fetch one row from `patients`."""
 
-from services import supabase_client
+from services.supabase_client import read_records
 
+rows = read_records("patients", limit=1)
 
-def main() -> None:
-    rows = supabase_client.read_records("patients", limit=1)
-    if not rows:
-        print("No rows in patients table.")
-        return
+if rows:
+    print("First patient row:")
     print(rows[0])
-
-
-if __name__ == "__main__":
-    main()
+else:
+    print("No rows found in `patients` (or table empty).")
