@@ -10,5 +10,6 @@ supabase
 daily-python
 picamera2
 numpy
+pygame
 
 
