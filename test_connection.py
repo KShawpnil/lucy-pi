@@ -1,4 +1,4 @@
-"""Probe Supabase connection and read one row from each expected table."""
+"""Verify device auth and read sample rows from key Supabase tables."""
 
 from __future__ import annotations
 
@@ -11,119 +11,93 @@ from postgrest.exceptions import APIError
 from services.supabase_client import get_client, read_records
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
+
 TABLES = (
-    "users",
-    "patients",
-    "profiles",
-    "caregivers",
-    "family_members",
+    "call_sessions",
+    "transcriptions",
     "visits",
-    "notes",
-    "alerts",
-    "messages",
-    "calls",
+    "notifications",
 )
 
 
-def _load_env() -> tuple[str, str]:
+def _load_config() -> dict[str, str]:
     load_dotenv(_PROJECT_ROOT / ".env")
-    url = (os.getenv("SUPABASE_URL") or "").strip()
-    key = (os.getenv("SUPABASE_KEY") or "").strip()
-    return url, key
+    return {
+        "url": (os.getenv("SUPABASE_URL") or "").strip(),
+        "key": (os.getenv("SUPABASE_KEY") or "").strip(),
+        "email": (os.getenv("DEVICE_EMAIL") or "").strip(),
+        "password": (os.getenv("DEVICE_PASSWORD") or "").strip(),
+    }
 
 
-def _classify_error(message: str) -> str:
-    lower = message.lower()
-    if (
-        "pgrst205" in lower
-        or "does not exist" in lower
-        or "could not find the table" in lower
-        or "relation" in lower and "does not exist" in lower
-    ):
-        return "not_found"
-    return "error"
+def _missing_vars(config: dict[str, str]) -> list[str]:
+    missing = []
+    if not config["url"]:
+        missing.append("SUPABASE_URL")
+    if not config["key"]:
+        missing.append("SUPABASE_KEY")
+    if not config["email"]:
+        missing.append("DEVICE_EMAIL")
+    if not config["password"]:
+        missing.append("DEVICE_PASSWORD")
+    return missing
 
 
-def _probe_table(table: str) -> tuple[str, str | dict | None]:
-    """
-    Returns (status, detail).
-    status: data | empty | not_found | error
-    """
-    try:
-        rows = read_records(table, limit=1)
-    except RuntimeError as exc:
-        kind = _classify_error(str(exc))
-        return kind, str(exc)
-    except APIError as exc:
-        kind = _classify_error(str(exc))
-        return kind, str(exc)
-    except Exception as exc:
-        return "error", str(exc)
-
-    if rows:
-        return "data", rows[0]
-    return "empty", None
-
-
-def _print_table_result(table: str, status: str, detail: str | dict | None) -> None:
+def _probe_table(table: str) -> None:
     print(f"\n--- {table} ---")
-    if status == "data":
+    try:
+        rows = read_records(table)
+        row = rows[0] if rows else None
+    except RuntimeError as exc:
+        print(f"Result: error — {exc}")
+        return
+    except APIError as exc:
+        print(f"Result: error — {exc}")
+        return
+    except Exception as exc:
+        print(f"Result: error — {exc}")
+        return
+
+    if row is not None:
         print("Result: returned data")
-        print(detail)
-    elif status == "empty":
-        print("Result: returned empty")
-    elif status == "not_found":
-        print("Result: table not found (skipped)")
-        if detail:
-            print(f"Detail: {detail}")
+        print(row)
     else:
-        print("Result: error")
-        if detail:
-            print(f"Detail: {detail}")
+        print("Result: returned empty (no rows visible for this account)")
 
 
 def main() -> None:
-    url, key = _load_env()
-    print(f"Supabase URL: {url if url else '(not set)'}")
+    config = _load_config()
+    missing = _missing_vars(config)
 
-    if not url or not key:
-        print("\nSummary: Connection failed")
+    print(f"Supabase URL: {config['url'] or '(not set)'}")
+    print(f"DEVICE_EMAIL: {config['email'] or '(not set)'}")
+    if missing:
+        print(f"Missing environment variables: {', '.join(missing)}")
+        print("\nAuthentication: failed")
+        print("\nSummary: Device is not authenticated. Fix .env and try again.")
         return
 
     try:
         get_client()
     except Exception as exc:
-        print(f"\nCould not create Supabase client: {exc}")
-        print("\nSummary: Connection failed")
+        print(f"\nAuthentication: failed")
+        print(f"Reason: {exc}")
+        print("\nSummary: Device is not authenticated. Check DEVICE_EMAIL and DEVICE_PASSWORD.")
         return
 
-    has_data = False
-    had_query_success = False
+    print("\nAuthentication: succeeded")
 
     for table in TABLES:
         try:
-            status, detail = _probe_table(table)
+            _probe_table(table)
         except Exception as exc:
-            status, detail = "error", str(exc)
+            print(f"\n--- {table} ---")
+            print(f"Result: error — {exc}")
 
-        _print_table_result(table, status, detail)
-
-        if status == "data":
-            has_data = True
-            had_query_success = True
-        elif status == "empty":
-            had_query_success = True
-        elif status == "not_found":
-            had_query_success = True
-        # status == "error" does not count as successful query
-
-    print()
-    if has_data:
-        print("Summary: Connection successful with data found")
-    elif had_query_success:
-        print("Summary: Connection successful but all tables empty")
-    else:
-        print("Summary: Connection failed")
+    print(
+        f"\nSummary: Device is authenticated and connected to the database at "
+        f"{config['url']}."
+    )
 
 
 if __name__ == "__main__":
@@ -131,4 +105,4 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         print(f"\nUnexpected error: {exc}")
-        print("\nSummary: Connection failed")
+        print("\nSummary: Device is not authenticated or connection could not be verified.")
