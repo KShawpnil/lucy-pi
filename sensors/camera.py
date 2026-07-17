@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pygame
 import sounddevice as sd
 from dotenv import load_dotenv
 from daily import CallClient, Daily, EventHandler
@@ -26,6 +25,10 @@ VIDEO_WIDTH = 1280
 VIDEO_HEIGHT = 720
 VIDEO_FPS = 30
 VIDEO_COLOR_FORMAT = "RGB"
+
+# Pygame monitor output (HDMI)
+DISPLAY_WIDTH = 1280
+DISPLAY_HEIGHT = 720
 
 # Daily virtual microphone (fed from reSpeaker via sounddevice)
 MIC_DEVICE_NAME = "lucy-respeaker"
@@ -45,6 +48,20 @@ def _ensure_daily_init() -> None:
     if not _daily_initialized:
         Daily.init()
         _daily_initialized = True
+
+
+def _configure_pi_hdmi_display_env() -> None:
+    """
+    Route pygame/SDL to the locally connected HDMI monitor, not an SSH session.
+
+    Run before pygame.init() in the display thread.
+    """
+    if not os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = ":0"
+    # Prefer the Pi desktop/X11 session on HDMI; fall back to KMS if needed.
+    if not os.environ.get("SDL_VIDEODRIVER"):
+        os.environ["SDL_VIDEODRIVER"] = "x11"
+    os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
 
 
 def _find_respeaker_input_device() -> int | None:
@@ -70,8 +87,16 @@ def _default_output_device() -> int | None:
 
 def _participant_id(participant: Any) -> str | None:
     if isinstance(participant, dict):
-        return participant.get("id") or participant.get("session_id")
-    return getattr(participant, "id", None) or getattr(participant, "session_id", None)
+        return (
+            participant.get("session_id")
+            or participant.get("id")
+            or participant.get("user_id")
+        )
+    return (
+        getattr(participant, "session_id", None)
+        or getattr(participant, "id", None)
+        or getattr(participant, "user_id", None)
+    )
 
 
 def _is_local_participant(participant: Any) -> bool:
@@ -92,8 +117,29 @@ def _is_valid_remote_participant_id(participant_id: str | None, info: Any = None
     return True
 
 
+def _video_frame_to_surface(video_frame: Any) -> Any:
+    """Convert a Daily VideoFrame buffer into a pygame Surface."""
+    import pygame
+
+    width = int(video_frame.width)
+    height = int(video_frame.height)
+    raw = video_frame.buffer
+    if not isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw)
+
+    color_format = getattr(video_frame, "color_format", "RGB")
+    if color_format == "RGBA":
+        surface = pygame.image.frombuffer(raw, (width, height), "RGBA")
+        return surface.convert()
+    if color_format == "RGB":
+        return pygame.image.frombuffer(raw, (width, height), "RGB")
+
+    array = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+    return pygame.surfarray.make_surface(np.transpose(array, (1, 0, 2)))
+
+
 class _CallEventHandler(EventHandler):
-    """Attach remote audio renderers when participants join (no wildcard IDs)."""
+    """Handle remote participants joining — attach audio and incoming video."""
 
     def __init__(self, manager: "CameraManager") -> None:
         super().__init__()
@@ -104,11 +150,23 @@ class _CallEventHandler(EventHandler):
             session_id = _participant_id(participant)
             if session_id and session_id.lower() not in ("local", "*"):
                 self._manager._local_participant_id = session_id
+            print("Lucy Pi: local participant joined Daily room.")
+            return
+
+        participant_id = _participant_id(participant)
+        if not _is_valid_remote_participant_id(participant_id, participant):
+            print(f"Lucy Pi: ignored participant join (invalid id={participant_id!r}).")
+            return
+
+        print(f"Lucy Pi: remote participant joined — session_id={participant_id}")
+        self._manager._on_remote_participant_joined(str(participant_id))
+
+    def on_participant_updated(self, participant: Any) -> None:
+        if _is_local_participant(participant):
             return
         participant_id = _participant_id(participant)
         if _is_valid_remote_participant_id(participant_id, participant):
-            self._manager._attach_remote_audio_renderer(participant_id)
-            self._manager.display_incoming_video(participant_id)
+            self._manager._on_remote_participant_joined(str(participant_id))
 
 
 class CameraManager:
@@ -133,11 +191,13 @@ class CameraManager:
         self._audio_renderer_participants: set[str] = set()
         self._video_renderer_participants: set[str] = set()
         self._on_remote_audio: Any = None
+        self._on_remote_video: Any = None
         self._display_thread: threading.Thread | None = None
         self._display_active = False
+        self._display_ready = threading.Event()
         self._frame_lock = threading.Lock()
-        self._pending_frame: pygame.Surface | None = None
-        self._pygame_screen: pygame.Surface | None = None
+        self._pending_frame: Any = None
+        self._pygame_screen: Any = None
 
     def _resolve_mic_sample_rate(self) -> int:
         """Pick the first supported input sample rate (16 kHz preferred for reSpeaker)."""
@@ -186,6 +246,12 @@ class CameraManager:
             non_blocking=True,
         )
 
+        self._stop_event.clear()
+        self._display_ready.clear()
+        self._start_remote_audio_playback()
+        self._ensure_remote_video_callback()
+        self._start_incoming_video_display()
+
         client = CallClient(event_handler=_CallEventHandler(self))
         self.current_call_client = client
 
@@ -209,8 +275,8 @@ class CameraManager:
             },
         )
 
-        self._start_remote_audio_playback()
-        self._stop_event.clear()
+        self._register_existing_remote_participants(client)
+
         self._video_thread = threading.Thread(
             target=self._stream_picamera_frames,
             name="lucy-video-stream",
@@ -239,7 +305,8 @@ class CameraManager:
             f"Lucy Pi: joined video call at {room_url}\n"
             f"  Video: Picamera2 → {CAMERA_DEVICE_NAME} ({VIDEO_WIDTH}x{VIDEO_HEIGHT})\n"
             f"  Audio in: {mic_label} @ {self._mic_sample_rate} Hz\n"
-            f"  Audio out: {out_label}"
+            f"  Audio out: {out_label}\n"
+            f"  Display: HDMI monitor {DISPLAY_WIDTH}x{DISPLAY_HEIGHT} (DISPLAY={os.environ.get('DISPLAY', ':0')})"
         )
 
     def leave_video_call(self) -> None:
@@ -248,6 +315,7 @@ class CameraManager:
             return
 
         self._stop_event.set()
+        self._display_active = False
 
         if self._video_thread and self._video_thread.is_alive():
             self._video_thread.join(timeout=2.0)
@@ -275,6 +343,7 @@ class CameraManager:
         self._audio_renderer_participants.clear()
         self._video_renderer_participants.clear()
         self._on_remote_audio = None
+        self._on_remote_video = None
         with self._frame_lock:
             self._pending_frame = None
 
@@ -282,6 +351,149 @@ class CameraManager:
 
     def is_active(self) -> bool:
         return self.is_call_active
+
+    def _on_remote_participant_joined(self, participant_id: str) -> None:
+        """Start HDMI display (if needed) and subscribe to remote camera video."""
+        self._attach_remote_audio_renderer(participant_id)
+        self.display_incoming_video(participant_id)
+
+    def display_incoming_video(self, participant_id: str) -> None:
+        """Register a Daily video renderer for one remote participant session ID."""
+        if not _is_valid_remote_participant_id(participant_id):
+            return
+        if (
+            self.current_call_client is None
+            or participant_id in self._video_renderer_participants
+            or participant_id == self._local_participant_id
+        ):
+            return
+
+        self._start_incoming_video_display()
+        if not self._display_ready.wait(timeout=10.0):
+            print("Lucy Pi: HDMI display not ready — video may not appear.")
+
+        self._ensure_remote_video_callback()
+
+        try:
+            self.current_call_client.set_video_renderer(
+                participant_id,
+                self._on_remote_video,
+                video_source="camera",
+                color_format="RGBA",
+            )
+            self._video_renderer_participants.add(participant_id)
+            print(
+                f"Lucy Pi: receiving video from participant {participant_id} "
+                f"on {DISPLAY_WIDTH}x{DISPLAY_HEIGHT} HDMI display."
+            )
+        except Exception as exc:
+            print(
+                f"Lucy Pi: could not attach video renderer for "
+                f"participant {participant_id} — {exc}"
+            )
+
+    def _ensure_remote_video_callback(self) -> None:
+        if self._on_remote_video is not None:
+            return
+
+        def on_remote_video(
+            remote_participant_id: str, video_frame: Any, video_source: str
+        ) -> None:
+            if self._stop_event.is_set() or not self._display_active:
+                return
+            try:
+                surface = _video_frame_to_surface(video_frame)
+                with self._frame_lock:
+                    self._pending_frame = surface
+            except Exception as exc:
+                print(f"Lucy Pi: incoming video frame error — {exc}")
+
+        self._on_remote_video = on_remote_video
+
+    def _start_incoming_video_display(self) -> None:
+        if self._display_thread and self._display_thread.is_alive():
+            return
+
+        self._display_active = True
+        self._display_thread = threading.Thread(
+            target=self._pygame_display_loop,
+            name="lucy-incoming-video-display",
+            daemon=True,
+        )
+        self._display_thread.start()
+
+    def _pygame_display_loop(self) -> None:
+        import pygame
+
+        try:
+            _configure_pi_hdmi_display_env()
+            pygame.init()
+            pygame.display.init()
+
+            try:
+                self._pygame_screen = pygame.display.set_mode(
+                    (DISPLAY_WIDTH, DISPLAY_HEIGHT),
+                    pygame.FULLSCREEN,
+                )
+            except pygame.error:
+                # Some Pi setups reject FULLSCREEN — still use 1280x720 windowed on HDMI.
+                self._pygame_screen = pygame.display.set_mode(
+                    (DISPLAY_WIDTH, DISPLAY_HEIGHT)
+                )
+
+            pygame.display.set_caption("Lucy — Incoming Call")
+            self._pygame_screen.fill((0, 0, 0))
+            pygame.display.flip()
+            self._display_ready.set()
+            print(
+                f"Lucy Pi: pygame display ready on HDMI "
+                f"({DISPLAY_WIDTH}x{DISPLAY_HEIGHT}, DISPLAY={os.environ.get('DISPLAY')})."
+            )
+
+            clock = pygame.time.Clock()
+            while not self._stop_event.is_set() and self._display_active:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self._display_active = False
+                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                        self._display_active = False
+
+                assert self._pygame_screen is not None
+                self._pygame_screen.fill((0, 0, 0))
+
+                with self._frame_lock:
+                    frame = self._pending_frame
+
+                if frame is not None:
+                    if frame.get_size() != (DISPLAY_WIDTH, DISPLAY_HEIGHT):
+                        frame = pygame.transform.smoothscale(
+                            frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT)
+                        )
+                    self._pygame_screen.blit(frame, (0, 0))
+
+                pygame.display.flip()
+                clock.tick(30)
+        except Exception as exc:
+            print(f"Lucy Pi: incoming video display error — {exc}")
+        finally:
+            try:
+                pygame.display.quit()
+                pygame.quit()
+            except Exception:
+                pass
+            self._pygame_screen = None
+            self._display_active = False
+            self._display_ready.clear()
+            print("Lucy Pi: pygame display closed.")
+
+    def _stop_incoming_video_display(self) -> None:
+        self._display_active = False
+        if self._display_thread and self._display_thread.is_alive():
+            self._display_thread.join(timeout=3.0)
+        self._display_thread = None
+        self._display_ready.clear()
+        with self._frame_lock:
+            self._pending_frame = None
 
     def _start_picamera(self) -> None:
         picam = Picamera2()
@@ -337,7 +549,7 @@ class CameraManager:
                 print(f"Lucy Pi: microphone stream error — {exc}")
 
     def _register_existing_remote_participants(self, client: CallClient) -> None:
-        """Attach audio renderers for remote participants already in the room."""
+        """Attach audio/video for remote participants already in the room."""
         try:
             participants = client.participants()
         except Exception as exc:
@@ -350,111 +562,13 @@ class CameraManager:
                 if session_id and session_id.lower() not in ("local", "*"):
                     self._local_participant_id = session_id
                 continue
-            if not _is_valid_remote_participant_id(participant_key, info):
-                continue
-            self._attach_remote_audio_renderer(str(participant_key))
-            self.display_incoming_video(str(participant_key))
 
-    def display_incoming_video(self, participant_id: str) -> None:
-        """
-        Open a fullscreen pygame window and show video from a remote participant.
-
-        Called when a remote participant joins; registers a Daily video renderer
-        for that participant's session ID.
-        """
-        if not _is_valid_remote_participant_id(participant_id):
-            return
-        if (
-            self.current_call_client is None
-            or participant_id in self._video_renderer_participants
-            or participant_id == self._local_participant_id
-        ):
-            return
-
-        self._start_incoming_video_display()
-
-        def on_remote_video(
-            remote_participant_id: str, video_frame: Any, video_source: str
-        ) -> None:
-            if self._stop_event.is_set() or not self._display_active:
-                return
-            try:
-                surface = _video_frame_to_surface(video_frame)
-                with self._frame_lock:
-                    self._pending_frame = surface
-            except Exception as exc:
-                print(f"Lucy Pi: incoming video frame error — {exc}")
-
-        try:
-            self.current_call_client.set_video_renderer(
-                participant_id,
-                on_remote_video,
-                video_source="camera",
-                color_format="RGB",
-            )
-            self._video_renderer_participants.add(participant_id)
-            print(f"Lucy Pi: displaying video from participant {participant_id}.")
-        except Exception as exc:
-            print(
-                f"Lucy Pi: could not attach video renderer for "
-                f"participant {participant_id} — {exc}"
-            )
-
-    def _start_incoming_video_display(self) -> None:
-        if self._display_thread and self._display_thread.is_alive():
-            return
-
-        self._display_active = True
-        self._display_thread = threading.Thread(
-            target=self._pygame_display_loop,
-            name="lucy-incoming-video-display",
-            daemon=True,
-        )
-        self._display_thread.start()
-
-    def _pygame_display_loop(self) -> None:
-        try:
-            pygame.init()
-            self._pygame_screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-            pygame.display.set_caption("Lucy — Incoming Call")
-            print("Lucy Pi: fullscreen incoming video display opened.")
-
-            while not self._stop_event.is_set() and self._display_active:
-                for event in pygame.event.get():
-                    if event.type in (pygame.QUIT, pygame.KEYDOWN):
-                        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                            self._display_active = False
-                            break
-
-                with self._frame_lock:
-                    frame = self._pending_frame
-
-                if frame is not None and self._pygame_screen is not None:
-                    scaled = pygame.transform.smoothscale(
-                        frame, self._pygame_screen.get_size()
-                    )
-                    self._pygame_screen.blit(scaled, (0, 0))
-
-                pygame.display.flip()
-                time.sleep(0.01)
-        except Exception as exc:
-            print(f"Lucy Pi: incoming video display error — {exc}")
-        finally:
-            try:
-                pygame.display.quit()
-                pygame.quit()
-            except Exception:
-                pass
-            self._pygame_screen = None
-            self._display_active = False
-
-    def _stop_incoming_video_display(self) -> None:
-        self._display_active = False
-        if self._display_thread and self._display_thread.is_alive():
-            self._display_thread.join(timeout=2.0)
-        self._display_thread = None
-        with self._frame_lock:
-            self._pending_frame = None
+            remote_id = _participant_id(info) if isinstance(info, dict) else None
+            candidate = remote_id if _is_valid_remote_participant_id(remote_id, info) else None
+            if candidate is None and _is_valid_remote_participant_id(participant_key, info):
+                candidate = str(participant_key)
+            if candidate:
+                self._on_remote_participant_joined(candidate)
 
     def _attach_remote_audio_renderer(self, participant_id: str) -> None:
         """Register Daily audio output for one remote participant session ID."""
@@ -509,7 +623,6 @@ class CameraManager:
         )
         self._output_stream.start()
 
-
     def _stop_remote_audio_playback(self) -> None:
         if self._output_stream is None:
             return
@@ -520,25 +633,6 @@ class CameraManager:
             print(f"Lucy Pi: warning while stopping audio output — {exc}")
         finally:
             self._output_stream = None
-
-
-def _video_frame_to_surface(video_frame: Any) -> pygame.Surface:
-    """Convert a Daily VideoFrame buffer into a pygame Surface."""
-    width = int(video_frame.width)
-    height = int(video_frame.height)
-    raw = video_frame.buffer
-    if not isinstance(raw, (bytes, bytearray)):
-        raw = bytes(raw)
-
-    color_format = getattr(video_frame, "color_format", "RGB")
-    if color_format == "RGBA":
-        array = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 4))
-        array = array[:, :, :3]
-    else:
-        array = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
-
-    # surfarray.make_surface expects shape (width, height, 3)
-    return pygame.surfarray.make_surface(np.transpose(array, (1, 0, 2)))
 
 
 camera = CameraManager()
