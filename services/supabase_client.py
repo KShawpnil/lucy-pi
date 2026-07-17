@@ -74,6 +74,45 @@ def describe_connection() -> dict[str, str | None]:
     }
 
 
+def patient_filters_from_env() -> dict[str, Any] | None:
+    """
+    Build equality filters for the `patients` table from device env vars.
+
+    - LUCY_PATIENT_ID / PATIENT_ID → patients.id (patient role row UUID)
+    - LUCY_USER_ID / USER_ID → patients.user_id (auth.users.id / profiles.id)
+    """
+    patient_row_id = _env("LUCY_PATIENT_ID") or _env("PATIENT_ID")
+    if patient_row_id:
+        return {"id": patient_row_id}
+
+    auth_user_id = _env("LUCY_USER_ID") or _env("USER_ID")
+    if auth_user_id:
+        return {"user_id": auth_user_id}
+
+    return None
+
+
+def resolve_patient_row() -> dict[str, Any] | None:
+    """
+    Load the patient row for this device.
+
+    Uses patient_filters_from_env() when set; otherwise returns the first patient row.
+    """
+    filters = patient_filters_from_env()
+    rows = read_records("patients", filters=filters, limit=1)
+    if rows:
+        return rows[0]
+
+    # Common misconfiguration: auth user UUID stored in PATIENT_ID.
+    misassigned = _env("LUCY_PATIENT_ID") or _env("PATIENT_ID")
+    if misassigned and filters and "id" in filters:
+        rows = read_records("patients", filters={"user_id": misassigned}, limit=1)
+        if rows:
+            return rows[0]
+
+    return None
+
+
 def _apply_eq_filters(query: Any, filters: dict[str, Any] | None) -> Any:
     if not filters:
         return query
