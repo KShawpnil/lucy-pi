@@ -8,5 +8,7 @@ python-dotenv
 SpeechRecognition
 supabase
 daily-python
+picamera2
+numpy
 
 
