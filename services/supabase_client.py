@@ -144,12 +144,17 @@ def insert_record(table: str, data: dict[str, Any]) -> list[dict[str, Any]]:
 def read_records(
     table: str,
     filters: dict[str, Any] | None = None,
+    *,
+    gte_filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Read rows from `table`, optionally filtered with column equality (`eq`)."""
+    """Read rows from `table`, with optional equality and >= filters."""
 
     def _read() -> list[dict[str, Any]]:
         query = get_client().table(table).select("*")
         query = _apply_eq_filters(query, filters)
+        if gte_filters:
+            for column, value in gte_filters.items():
+                query = query.gte(column, value)
         try:
             response = query.execute()
         except APIError as exc:

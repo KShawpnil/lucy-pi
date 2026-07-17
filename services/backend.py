@@ -1,8 +1,9 @@
-"""Backend API for Lucy Pi — Supabase auth, CRUD, and call-session realtime."""
+"""Backend API for Lucy Pi — Supabase auth and CRUD."""
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from services import supabase_client as db
 
@@ -19,8 +20,10 @@ def insert_record(table: str, data: dict[str, Any]) -> list[dict[str, Any]]:
 def read_records(
     table: str,
     filters: dict[str, Any] | None = None,
+    *,
+    gte_filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    return db.read_records(table, filters=filters)
+    return db.read_records(table, filters, gte_filters=gte_filters)
 
 
 def update_record(
@@ -31,33 +34,18 @@ def update_record(
     return db.update_record(table, record_id, data)
 
 
-def subscribe_call_sessions(
-    on_pending_insert: Callable[[dict[str, Any]], None],
-    on_ended_update: Callable[[dict[str, Any]], None],
-    *,
-    channel_name: str = "lucy-call-sessions",
-) -> Any:
-    """
-    Subscribe to call_sessions INSERT (status pending) and UPDATE (status ended).
-
-    Callbacks receive the Realtime postgres_changes payload.
-    """
-    client = db.get_client()
-    channel = client.channel(channel_name)
-
-    channel.on_postgres_changes(
-        "INSERT",
-        schema="public",
-        table="call_sessions",
-        filter="status=eq.pending",
-        callback=on_pending_insert,
+def read_recent_pending_call_sessions(within_seconds: int = 60) -> list[dict[str, Any]]:
+    """Return pending call_sessions created within the last `within_seconds`."""
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=within_seconds)
+    ).isoformat()
+    return read_records(
+        "call_sessions",
+        filters={"status": "pending"},
+        gte_filters={"created_at": cutoff},
     )
-    channel.on_postgres_changes(
-        "UPDATE",
-        schema="public",
-        table="call_sessions",
-        filter="status=eq.ended",
-        callback=on_ended_update,
-    )
-    channel.subscribe()
-    return channel
+
+
+def read_call_session(session_id: str) -> dict[str, Any] | None:
+    rows = read_records("call_sessions", filters={"id": session_id})
+    return rows[0] if rows else None

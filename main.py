@@ -13,6 +13,12 @@ from sensors import motor
 from sensors.camera import camera
 from services import backend
 
+POLL_INTERVAL_SECONDS = 2
+PENDING_LOOKBACK_SECONDS = 60
+
+processed_calls: set[str] = set()
+active_session_id: str | None = None
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -31,17 +37,9 @@ def _parse_utc(value: str | datetime | None) -> datetime | None:
     return datetime.fromisoformat(text)
 
 
-def _record_from_payload(payload: dict) -> dict:
-    """Extract the new row from a Supabase Realtime postgres_changes payload."""
-    if "new" in payload and isinstance(payload["new"], dict):
-        return payload["new"]
-    if "record" in payload and isinstance(payload["record"], dict):
-        return payload["record"]
-    return payload
+def handle_incoming_call(record: dict) -> None:
+    global active_session_id
 
-
-def handle_incoming_call(payload: dict) -> None:
-    record = _record_from_payload(payload)
     session_id = record.get("id")
     room_url = record.get("room_url")
 
@@ -51,10 +49,10 @@ def handle_incoming_call(payload: dict) -> None:
     )
 
     if not room_url:
-        print("Lucy Pi: missing room_url in call_sessions payload; skipping join.")
+        print("Lucy Pi: missing room_url in call_sessions row; skipping join.")
         return
     if not session_id:
-        print("Lucy Pi: missing session id in call_sessions payload; skipping join.")
+        print("Lucy Pi: missing session id in call_sessions row; skipping join.")
         return
 
     motor.open_eyelids()
@@ -67,10 +65,13 @@ def handle_incoming_call(payload: dict) -> None:
             "answered_at": _utc_now_iso(),
         },
     )
+    active_session_id = str(session_id)
     print(f"Lucy Pi: call is now active (session_id={session_id}).")
 
 
 def handle_call_ended(session_id: str, started_at: str | datetime | None) -> None:
+    global active_session_id
+
     print(f"Lucy Pi: call has ended (session_id={session_id}).")
 
     camera.leave_video_call()
@@ -89,45 +90,63 @@ def handle_call_ended(session_id: str, started_at: str | datetime | None) -> Non
         update_data["duration_seconds"] = int(duration_seconds)
 
     backend.update_record("call_sessions", str(session_id), update_data)
+    if active_session_id == str(session_id):
+        active_session_id = None
+
     print(
         f"Lucy Pi: eyelids closed and call session updated "
         f"(session_id={session_id})."
     )
 
 
-def _on_pending_insert(payload: dict) -> None:
-    try:
-        handle_incoming_call(payload)
-    except Exception as exc:
-        print(f"Lucy Pi: error handling incoming call — {exc}")
-
-
-def _on_ended_update(payload: dict) -> None:
-    try:
-        record = _record_from_payload(payload)
-        session_id = record.get("id")
+def _poll_pending_calls() -> None:
+    rows = backend.read_recent_pending_call_sessions(PENDING_LOOKBACK_SECONDS)
+    for row in rows:
+        session_id = row.get("id")
         if not session_id:
-            print("Lucy Pi: ended update missing session id; skipping.")
-            return
-        started_at = record.get("started_at") or record.get("answered_at")
-        handle_call_ended(str(session_id), started_at)
+            continue
+        session_key = str(session_id)
+        if session_key in processed_calls:
+            continue
+        processed_calls.add(session_key)
+        try:
+            handle_incoming_call(row)
+        except Exception as exc:
+            print(f"Lucy Pi: error handling incoming call — {exc}")
+
+
+def _poll_active_call_ended() -> None:
+    global active_session_id
+
+    if not camera.is_active() or not active_session_id:
+        return
+
+    try:
+        row = backend.read_call_session(active_session_id)
     except Exception as exc:
-        print(f"Lucy Pi: error handling call ended — {exc}")
+        print(f"Lucy Pi: error checking active call session — {exc}")
+        return
+
+    if row is None:
+        return
+
+    if row.get("status") == "ended":
+        started_at = row.get("started_at") or row.get("answered_at")
+        try:
+            handle_call_ended(active_session_id, started_at)
+        except Exception as exc:
+            print(f"Lucy Pi: error handling call ended — {exc}")
 
 
 def monitor_calls() -> None:
-    """Listen for pending and ended call_sessions via Supabase Realtime."""
+    """Poll call_sessions for pending and ended calls every two seconds."""
     while True:
         try:
-            backend.subscribe_call_sessions(
-                on_pending_insert=_on_pending_insert,
-                on_ended_update=_on_ended_update,
-            )
-            while True:
-                time.sleep(1)
+            _poll_pending_calls()
+            _poll_active_call_ended()
         except Exception as exc:
-            print(f"Lucy Pi: realtime subscription error — {exc}. Reconnecting in 5s…")
-            time.sleep(5)
+            print(f"Lucy Pi: call monitor error — {exc}")
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 def startup() -> None:
