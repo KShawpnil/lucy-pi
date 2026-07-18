@@ -153,7 +153,7 @@ def monitor_calls() -> None:
 
 def handle_wake_word(transcribed_text: str) -> None:
     print(f"Lucy Pi: new transcription received — {transcribed_text}")
-    speaker.speak("Got it, I have saved your note.")
+    speaker.speak_async("Got it, I have saved your note.")
     try:
         backend.insert_record(
             "transcriptions",
@@ -174,7 +174,7 @@ def handle_wake_word(transcribed_text: str) -> None:
 
 
 def handle_wake_word_detected() -> None:
-    speaker.speak_async("Lucy here, go ahead.")
+    speaker.speak("Lucy here, go ahead.")
 
 
 def startup() -> None:

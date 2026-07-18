@@ -12,9 +12,9 @@ load_dotenv()
 
 SAMPLE_RATE = 16000
 CHUNK_SECONDS = 3
-RECORD_SECONDS = 30
-PAUSE_THRESHOLD = 1.5
-ENERGY_THRESHOLD = 300
+RECORD_SECONDS = 45
+PAUSE_THRESHOLD = 2.5
+ENERGY_THRESHOLD = 200
 WAKE_PHRASE = "hey lucy"
 
 
@@ -72,6 +72,7 @@ class MicrophoneManager:
 
     def _record_and_transcribe(self):
         try:
+            time.sleep(2.5)
             print("Lucy is listening for your note")
             audio_data = sd.rec(
                 int(RECORD_SECONDS * SAMPLE_RATE),
