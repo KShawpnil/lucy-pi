@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 
 from sensors import motor
 from sensors.camera import camera
+from sensors.microphone import microphone
+from sensors.speaker import speaker
 from services import backend
 
 POLL_INTERVAL_SECONDS = 2
@@ -149,6 +151,29 @@ def monitor_calls() -> None:
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
+def handle_wake_word(transcribed_text: str) -> None:
+    print(f"Lucy Pi: new transcription received — {transcribed_text}")
+    speaker.speak("Got it, I have saved your note.")
+    try:
+        backend.insert_record(
+            "transcriptions",
+            {
+                "patient_id": os.getenv("PATIENT_ID"),
+                "content": transcribed_text,
+                "status": "pending",
+                "created_at": datetime.utcnow().isoformat(),
+            },
+        )
+        print("Lucy Pi: transcription saved to Supabase successfully.")
+    except Exception as exc:
+        print(f"Lucy Pi: error saving transcription — {exc}")
+
+
+def handle_wake_word_detected() -> None:
+    speaker.speak("Lucy here, go ahead.")
+    time.sleep(0.8)
+
+
 def startup() -> None:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"Lucy Pi: starting up at {now}.")
@@ -161,6 +186,10 @@ def startup() -> None:
         daemon=True,
     )
     thread.start()
+
+    microphone.wake_word_detected_callback = handle_wake_word_detected
+    microphone.start_wake_word_detection(handle_wake_word)
+    print("Lucy Pi: wake word detection is active and listening.")
 
     print("Lucy Pi: ready and listening for calls.")
 

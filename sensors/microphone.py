@@ -31,6 +31,7 @@ class MicrophoneManager:
         self.is_detecting = False
         self.is_recording = False
         self.wake_word_callback = None
+        self.wake_word_detected_callback = None
         self.sample_rate = 16000
         self.chunk_size = 1280
 
@@ -77,6 +78,12 @@ class MicrophoneManager:
                             if not self.is_recording:
                                 print("Wake word detected, starting recording")
                                 self.is_recording = True
+                                if self.wake_word_detected_callback is not None:
+                                    threading.Thread(
+                                        target=self.wake_word_detected_callback,
+                                        name="lucy-wake-word-detected",
+                                        daemon=True,
+                                    ).start()
                                 threading.Thread(
                                     target=self._record_and_transcribe,
                                     name="lucy-record-transcribe",
