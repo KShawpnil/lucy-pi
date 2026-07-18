@@ -60,7 +60,7 @@ class MicrophoneManager:
                                 daemon=True
                             )
                             t.start()
-                            time.sleep(2)
+                            time.sleep(5)
                 except sr.UnknownValueError:
                     pass
                 except sr.RequestError as e:
@@ -72,7 +72,7 @@ class MicrophoneManager:
 
     def _record_and_transcribe(self):
         try:
-            time.sleep(2.5)
+            time.sleep(3.5)
             print("Lucy is listening for your note")
             audio_data = sd.rec(
                 int(RECORD_SECONDS * SAMPLE_RATE),
@@ -105,9 +105,14 @@ class MicrophoneManager:
                 transcription = self.recognizer.recognize_google(
                     recorded, language="en-US"
                 )
-                print(f"Lucy transcribed: {transcription}")
+                cleaned = transcription.strip()
+                if cleaned.lower().startswith(WAKE_PHRASE):
+                    cleaned = cleaned.replace(cleaned[: len(WAKE_PHRASE)], "", 1).strip()
+                if cleaned.lower().endswith("stop"):
+                    cleaned = cleaned.replace("stop", "", 1).strip()
+                print(f"Lucy transcribed: {cleaned}")
                 if self.wake_word_callback:
-                    self.wake_word_callback(transcription)
+                    self.wake_word_callback(cleaned)
             except sr.UnknownValueError:
                 print("Lucy could not understand the audio")
             except sr.RequestError as e:
