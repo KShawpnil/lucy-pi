@@ -1,3 +1,5 @@
+openwakeword
+onnxruntime
 pvporcupine
 sounddevice
 pyttsx3
