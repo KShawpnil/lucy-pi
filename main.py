@@ -58,7 +58,7 @@ def handle_incoming_call(record: dict) -> None:
         return
 
     motor.open_eyelids()
-    microphone.stop()
+    microphone.release_microphone()
     camera.join_video_call(room_url)
     backend.update_record(
         "call_sessions",

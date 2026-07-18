@@ -137,9 +137,16 @@ class MicrophoneManager:
         finally:
             self.is_recording = False
 
-    def stop(self):
+    def release_microphone(self):
         self.is_detecting = False
-        print("Lucy microphone detection stopped")
+        self.is_recording = False
+        sd.stop()
+        sd.wait()
+        time.sleep(2)
+        print("Lucy microphone fully released")
+
+    def stop(self):
+        self.release_microphone()
 
     def restart(self):
         self.is_detecting = False
