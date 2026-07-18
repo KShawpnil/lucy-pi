@@ -38,6 +38,9 @@ class MicrophoneManager:
 
     def _detection_loop(self):
         while self.is_detecting:
+            if self.is_recording:
+                time.sleep(0.5)
+                continue
             try:
                 audio_data = sd.rec(
                     int(CHUNK_SECONDS * SAMPLE_RATE),
@@ -74,14 +77,26 @@ class MicrophoneManager:
         try:
             time.sleep(3.5)
             print("Lucy is listening for your note")
-            audio_data = sd.rec(
-                int(RECORD_SECONDS * SAMPLE_RATE),
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype='int16'
-            )
-            sd.wait()
-            samples = audio_data.flatten()
+            max_samples = 60 * SAMPLE_RATE
+            silence_samples = 3 * SAMPLE_RATE
+            silence_threshold = 300
+            chunk_samples = SAMPLE_RATE
+            chunks = []
+            while sum(len(chunk) for chunk in chunks) < max_samples:
+                block = sd.rec(
+                    chunk_samples,
+                    samplerate=SAMPLE_RATE,
+                    channels=1,
+                    dtype='int16'
+                )
+                sd.wait()
+                chunks.append(block.flatten())
+                combined = np.concatenate(chunks)
+                if len(combined) >= silence_samples:
+                    last_window = combined[-silence_samples:]
+                    if np.max(np.abs(last_window)) < silence_threshold:
+                        break
+            samples = np.concatenate(chunks)
             last_sound = np.where(np.abs(samples) > 500)[0]
             if len(last_sound) > 0:
                 trimmed = samples[:last_sound[-1] + 1]
