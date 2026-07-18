@@ -141,5 +141,10 @@ class MicrophoneManager:
         self.is_detecting = False
         print("Lucy microphone detection stopped")
 
+    def restart(self):
+        self.is_detecting = False
+        time.sleep(1)
+        self.start_wake_word_detection(self.wake_word_callback)
+
 
 microphone = MicrophoneManager()

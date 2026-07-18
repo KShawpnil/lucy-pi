@@ -58,6 +58,7 @@ def handle_incoming_call(record: dict) -> None:
         return
 
     motor.open_eyelids()
+    microphone.stop()
     camera.join_video_call(room_url)
     backend.update_record(
         "call_sessions",
@@ -69,6 +70,17 @@ def handle_incoming_call(record: dict) -> None:
     )
     active_session_id = str(session_id)
     print(f"Lucy Pi: call is now active (session_id={session_id}).")
+
+    def _resume_mic_after_call() -> None:
+        while camera.is_active():
+            time.sleep(2)
+        microphone.restart()
+
+    threading.Thread(
+        target=_resume_mic_after_call,
+        name="lucy-mic-resume",
+        daemon=True,
+    ).start()
 
 
 def handle_call_ended(session_id: str, started_at: str | datetime | None) -> None:
