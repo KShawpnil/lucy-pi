@@ -159,8 +159,12 @@ def handle_wake_word(transcribed_text: str) -> None:
             "transcriptions",
             {
                 "patient_id": os.getenv("PATIENT_ID"),
-                "content": transcribed_text,
+                "visit_id": None,
+                "ai_content": transcribed_text,
+                "edited_content": None,
                 "status": "pending",
+                "reviewed_by": None,
+                "reviewed_at": None,
                 "created_at": datetime.utcnow().isoformat(),
             },
         )
