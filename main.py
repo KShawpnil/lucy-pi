@@ -174,8 +174,7 @@ def handle_wake_word(transcribed_text: str) -> None:
 
 
 def handle_wake_word_detected() -> None:
-    speaker.speak("Lucy here, go ahead.")
-    time.sleep(0.8)
+    speaker.speak_async("Lucy here, go ahead.")
 
 
 def startup() -> None:
@@ -191,7 +190,6 @@ def startup() -> None:
     )
     thread.start()
 
-    microphone.wake_word_detected_callback = handle_wake_word_detected
     microphone.start_wake_word_detection(handle_wake_word)
     print("Lucy Pi: wake word detection is active and listening.")
 
