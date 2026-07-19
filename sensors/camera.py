@@ -228,6 +228,8 @@ class CameraManager:
         if self.is_call_active:
             raise RuntimeError("A video call is already active. Leave it before joining another.")
 
+        os.environ["SDL_VIDEODRIVER"] = "x11"
+        os.environ["SDL_RENDERDRIVER"] = "software"
         os.environ["DISPLAY"] = ":0"
 
         time.sleep(3)
@@ -406,7 +408,7 @@ class CameraManager:
         pygame.init()
         self._pygame_screen = pygame.display.set_mode(
             (DISPLAY_WIDTH, DISPLAY_HEIGHT),
-            pygame.FULLSCREEN,
+            pygame.FULLSCREEN | pygame.NOFRAME,
         )
         pygame.display.set_caption("Lucy Video Call")
         self._pygame_screen.fill((0, 0, 0))
