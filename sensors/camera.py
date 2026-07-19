@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import sounddevice as sd
@@ -172,7 +173,7 @@ class CameraManager:
 
         os.environ["DISPLAY"] = ":0"
 
-        time.sleep(3)
+        time.sleep(5)
 
         _ensure_daily_init()
 
@@ -284,6 +285,8 @@ class CameraManager:
     def _open_chromium_kiosk(self, room_url: str) -> None:
         """Open the Daily room in fullscreen Chromium on the Pi monitor."""
         os.environ["DISPLAY"] = ":0"
+        parsed = urlparse(room_url)
+        daily_origin = f"{parsed.scheme}://{parsed.netloc}"
         self.browser_process = subprocess.Popen(
             [
                 "chromium-browser",
@@ -292,6 +295,11 @@ class CameraManager:
                 "--disable-infobars",
                 "--autoplay-policy=no-user-gesture-required",
                 "--use-fake-ui-for-media-stream",
+                "--allow-running-insecure-content",
+                f"--unsafely-treat-insecure-origin-as-secure={daily_origin}",
+                "--enable-usermedia-screen-capturing",
+                "--auto-accept-camera-and-microphone-capture",
+                "--disable-web-security",
                 room_url,
             ]
         )

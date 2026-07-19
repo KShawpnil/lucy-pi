@@ -142,7 +142,9 @@ class MicrophoneManager:
         self.is_recording = False
         sd.stop()
         sd.wait()
-        time.sleep(2)
+        sd._terminate()
+        time.sleep(3)
+        sd._initialize()
         print("Lucy microphone fully released")
 
     def stop(self):
