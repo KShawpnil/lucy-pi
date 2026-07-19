@@ -6,7 +6,7 @@ SERVO_PIN = 25
 MIN_PULSE_WIDTH = 0.0005
 MAX_PULSE_WIDTH = 0.0025
 
-CLOSED_VALUE = -0.78
+CLOSED_VALUE = -0.778
 OPEN_VALUE = 0.0
 CLOSED_DEGREES = 10
 OPEN_DEGREES = 45
@@ -30,12 +30,12 @@ except Exception as exc:
 
 
 def _value_to_degrees(value: float) -> float:
-    return ((value + 1.0) / 2.0) * 90.0
+    return value * 45.0 + 45.0
 
 
 def _degrees_to_value(degrees: float) -> float:
     clamped = max(CLOSED_DEGREES, min(OPEN_DEGREES, degrees))
-    return (clamped / 90.0) * 2.0 - 1.0
+    return (clamped - 45.0) / 45.0
 
 
 def open_eyelids() -> None:
