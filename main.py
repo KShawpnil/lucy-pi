@@ -205,6 +205,7 @@ def startup() -> None:
     microphone.start_wake_word_detection(handle_wake_word)
     print("Lucy Pi: wake word detection is active and listening.")
 
+    motor.close_eyelids()
     print("Lucy Pi: ready and listening for calls.")
 
 
