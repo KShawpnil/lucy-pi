@@ -1,5 +1,12 @@
 """Text-to-speech output for Lucy Pi."""
 
+import os
+
+os.environ["AUDIODEV"] = "plughw:2,0"
+os.environ["AUDIODRIVER"] = "alsa"
+os.environ["ALSA_PCM_CARD"] = "2"
+os.environ["ALSA_PCM_DEVICE"] = "0"
+
 import threading
 import time
 
