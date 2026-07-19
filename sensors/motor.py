@@ -9,9 +9,7 @@ load_dotenv()
 import time
 
 from gpiozero import Device, Servo
-from gpiozero.pins.pigpio import PiGPIOFactory
-
-Device.pin_factory = PiGPIOFactory()
+from gpiozero.pins.rpi import RPiGPIOFactory
 
 CLOSED_DEGREES = 10
 OPEN_DEGREES = 45
@@ -19,23 +17,43 @@ MIN_DEGREES = 10
 MAX_DEGREES = 45
 
 SERVO_PIN = 25
-MIN_PULSE_WIDTH = 0.5 / 1000
-MAX_PULSE_WIDTH = 2.5 / 1000
+MIN_PULSE_WIDTH = 0.001
+MAX_PULSE_WIDTH = 0.002
 
 OPEN_STEP_SLEEP = 0.02
 CLOSE_STEP_SLEEP = 0.03
+SETTLE_SLEEP = 0.5
 
 current_position: float = CLOSED_DEGREES
 
-try:
-    servo = Servo(
+
+def _create_servo() -> Servo:
+    return Servo(
         SERVO_PIN,
         min_pulse_width=MIN_PULSE_WIDTH,
         max_pulse_width=MAX_PULSE_WIDTH,
     )
+
+
+servo: Servo | None = None
+try:
+    servo = _create_servo()
 except Exception as exc:
-    servo = None
-    print(f"Lucy Pi motor: failed to initialise servo on GPIO {SERVO_PIN} — {exc}")
+    error_text = str(exc).lower()
+    if "pigpio" in error_text or "failed to connect" in error_text:
+        try:
+            Device.pin_factory = RPiGPIOFactory()
+            servo = _create_servo()
+            print("Lucy Pi motor: pigpio unavailable, using default pin factory.")
+        except Exception as fallback_exc:
+            servo = None
+            print(
+                f"Lucy Pi motor: failed to initialise servo on GPIO {SERVO_PIN} "
+                f"— {fallback_exc}"
+            )
+    else:
+        servo = None
+        print(f"Lucy Pi motor: failed to initialise servo on GPIO {SERVO_PIN} — {exc}")
 
 
 def degrees_to_servo_value(degrees: float) -> float:
@@ -82,6 +100,7 @@ def open_eyelids() -> None:
         print(f"Lucy Pi motor: open_eyelids failed — {exc}")
         return
 
+    time.sleep(SETTLE_SLEEP)
     print("Eyelids fully open")
 
 
@@ -104,6 +123,7 @@ def close_eyelids() -> None:
         print(f"Lucy Pi motor: close_eyelids failed — {exc}")
         return
 
+    time.sleep(SETTLE_SLEEP)
     print("Eyelids fully closed")
 
 
