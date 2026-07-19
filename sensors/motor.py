@@ -8,7 +8,10 @@ load_dotenv()
 
 import time
 
-from gpiozero import Servo
+from gpiozero import Device, Servo
+from gpiozero.pins.pigpio import PiGPIOFactory
+
+Device.pin_factory = PiGPIOFactory()
 
 CLOSED_DEGREES = 10
 OPEN_DEGREES = 45
