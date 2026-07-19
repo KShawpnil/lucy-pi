@@ -6,8 +6,8 @@ SERVO_PIN = 25
 MIN_PULSE_WIDTH = 0.0005
 MAX_PULSE_WIDTH = 0.0025
 
-CLOSED_VALUE = -0.778
-OPEN_VALUE = 0.0
+CLOSED_VALUE = 0.0
+OPEN_VALUE = -0.778
 CLOSED_DEGREES = 10
 OPEN_DEGREES = 45
 
@@ -15,7 +15,7 @@ STEP = 0.05
 STEP_SLEEP = 0.02
 SETTLE_SLEEP = 0.5
 
-current_position = 10
+current_position = 45
 
 servo = None
 try:
