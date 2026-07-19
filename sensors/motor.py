@@ -6,8 +6,8 @@ SERVO_PIN = 25
 MIN_PULSE_WIDTH = 0.0005
 MAX_PULSE_WIDTH = 0.0025
 
-CLOSED_VALUE = 0.0
-OPEN_VALUE = -0.778
+CLOSED_VALUE = -0.778
+OPEN_VALUE = 0.0
 CLOSED_DEGREES = 10
 OPEN_DEGREES = 45
 
@@ -15,7 +15,7 @@ STEP = 0.05
 STEP_SLEEP = 0.02
 SETTLE_SLEEP = 0.5
 
-current_position = 45
+current_position = 10
 
 servo = None
 try:
@@ -24,7 +24,7 @@ try:
         min_pulse_width=MIN_PULSE_WIDTH,
         max_pulse_width=MAX_PULSE_WIDTH,
     )
-    servo.value = CLOSED_VALUE
+    servo.value = OPEN_VALUE
 except Exception as exc:
     print(f"Lucy Pi motor: failed to initialise servo on GPIO {SERVO_PIN} — {exc}")
 
@@ -38,7 +38,7 @@ def _degrees_to_value(degrees: float) -> float:
     return (clamped - 45.0) / 45.0
 
 
-def open_eyelids() -> None:
+def close_eyelids() -> None:
     global current_position
     if servo is None:
         print("Lucy Pi motor: open_eyelids skipped — servo not available.")
@@ -55,7 +55,7 @@ def open_eyelids() -> None:
     time.sleep(SETTLE_SLEEP)
 
 
-def close_eyelids() -> None:
+def open_eyelids() -> None:
     global current_position
     if servo is None:
         print("Lucy Pi motor: close_eyelids skipped — servo not available.")
