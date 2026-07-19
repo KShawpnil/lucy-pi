@@ -29,6 +29,8 @@ VIDEO_COLOR_FORMAT = "RGB"
 # Pygame monitor output (HDMI)
 DISPLAY_WIDTH = 1280
 DISPLAY_HEIGHT = 720
+CREAM_COLOR = (255, 250, 230)
+CONNECTING_TEXT_COLOR = (40, 40, 40)
 
 # Daily virtual microphone (fed from reSpeaker via sounddevice)
 MIC_DEVICE_NAME = "lucy-respeaker"
@@ -200,12 +202,12 @@ class CameraManager:
         self._pygame_screen: Any = None
 
     def _resolve_mic_sample_rate(self) -> int:
-        """Pick the first supported input sample rate (16 kHz preferred for reSpeaker)."""
+        """Pick the first supported input sample rate on the system default mic."""
         last_error: Exception | None = None
         for rate in MIC_SAMPLE_RATE_FALLBACKS:
             try:
                 sd.check_input_settings(
-                    device=self._respeaker_device,
+                    device=None,
                     samplerate=rate,
                     channels=MIC_CHANNELS,
                 )
@@ -219,18 +221,21 @@ class CameraManager:
                 last_error = exc
                 print(f"Lucy Pi: mic sample rate {rate} Hz failed — {exc}")
         raise RuntimeError(
-            "Could not configure reSpeaker microphone at 16000, 44100, or 48000 Hz"
+            "Could not configure system default microphone at 16000, 44100, or 48000 Hz"
         ) from last_error
 
     def join_video_call(self, room_url: str) -> None:
         if self.is_call_active:
             raise RuntimeError("A video call is already active. Leave it before joining another.")
 
+        os.environ["DISPLAY"] = ":0"
+
+        time.sleep(3)
+
         _ensure_daily_init()
 
-        self._respeaker_device = _find_respeaker_input_device()
         self._output_device = _default_output_device()
-        self._mic_sample_rate = self._resolve_mic_sample_rate()
+        self._mic_sample_rate = MIC_SAMPLE_RATE
 
         self._start_picamera()
         self._virtual_camera = Daily.create_camera_device(
@@ -239,18 +244,11 @@ class CameraManager:
             height=VIDEO_HEIGHT,
             color_format=VIDEO_COLOR_FORMAT,
         )
-        self._virtual_microphone = Daily.create_microphone_device(
-            MIC_DEVICE_NAME,
-            sample_rate=self._mic_sample_rate,
-            channels=MIC_CHANNELS,
-            non_blocking=True,
-        )
 
         self._stop_event.clear()
         self._display_ready.clear()
         self._start_remote_audio_playback()
         self._ensure_remote_video_callback()
-        self._start_incoming_video_display()
 
         client = CallClient(event_handler=_CallEventHandler(self))
         self.current_call_client = client
@@ -265,7 +263,6 @@ class CameraManager:
                     },
                     "microphone": {
                         "isEnabled": True,
-                        "settings": {"deviceId": MIC_DEVICE_NAME},
                     },
                 },
                 "publishing": {
@@ -282,20 +279,16 @@ class CameraManager:
             name="lucy-video-stream",
             daemon=True,
         )
-        self._mic_thread = threading.Thread(
-            target=self._stream_respeaker_audio,
-            name="lucy-mic-stream",
-            daemon=True,
-        )
         self._video_thread.start()
-        self._mic_thread.start()
+
+        self._open_video_display()
 
         self.is_call_active = True
-        mic_label = (
-            sd.query_devices(self._respeaker_device)["name"]
-            if self._respeaker_device is not None
-            else "default input (reSpeaker not detected by name)"
-        )
+        try:
+            default_input = sd.query_devices(kind="input")
+            mic_label = default_input.get("name", "system default input")
+        except Exception:
+            mic_label = "system default input"
         out_label = (
             sd.query_devices(self._output_device)["name"]
             if self._output_device is not None
@@ -319,11 +312,8 @@ class CameraManager:
 
         if self._video_thread and self._video_thread.is_alive():
             self._video_thread.join(timeout=2.0)
-        if self._mic_thread and self._mic_thread.is_alive():
-            self._mic_thread.join(timeout=2.0)
 
         self._video_thread = None
-        self._mic_thread = None
 
         if self.current_call_client is not None:
             try:
@@ -368,7 +358,6 @@ class CameraManager:
         ):
             return
 
-        self._start_incoming_video_display()
         if not self._display_ready.wait(timeout=10.0):
             print("Lucy Pi: HDMI display not ready — video may not appear.")
 
@@ -410,47 +399,42 @@ class CameraManager:
 
         self._on_remote_video = on_remote_video
 
-    def _start_incoming_video_display(self) -> None:
-        if self._display_thread and self._display_thread.is_alive():
-            return
+    def _open_video_display(self) -> None:
+        """Open the fullscreen HDMI window after joining the Daily room."""
+        import pygame
+
+        pygame.init()
+        self._pygame_screen = pygame.display.set_mode(
+            (DISPLAY_WIDTH, DISPLAY_HEIGHT),
+            pygame.FULLSCREEN,
+        )
+        pygame.display.set_caption("Lucy Video Call")
+        self._pygame_screen.fill((0, 0, 0))
+        pygame.display.flip()
 
         self._display_active = True
+        self._display_ready.set()
         self._display_thread = threading.Thread(
             target=self._pygame_display_loop,
             name="lucy-incoming-video-display",
             daemon=True,
         )
         self._display_thread.start()
+        print(
+            f"Lucy Pi: pygame display ready on HDMI "
+            f"({DISPLAY_WIDTH}x{DISPLAY_HEIGHT}, DISPLAY={os.environ.get('DISPLAY')})."
+        )
 
     def _pygame_display_loop(self) -> None:
         import pygame
 
         try:
-            _configure_pi_hdmi_display_env()
-            pygame.init()
-            pygame.display.init()
-
-            try:
-                self._pygame_screen = pygame.display.set_mode(
-                    (DISPLAY_WIDTH, DISPLAY_HEIGHT),
-                    pygame.FULLSCREEN,
-                )
-            except pygame.error:
-                # Some Pi setups reject FULLSCREEN — still use 1280x720 windowed on HDMI.
-                self._pygame_screen = pygame.display.set_mode(
-                    (DISPLAY_WIDTH, DISPLAY_HEIGHT)
-                )
-
-            pygame.display.set_caption("Lucy — Incoming Call")
-            self._pygame_screen.fill((0, 0, 0))
-            pygame.display.flip()
-            self._display_ready.set()
-            print(
-                f"Lucy Pi: pygame display ready on HDMI "
-                f"({DISPLAY_WIDTH}x{DISPLAY_HEIGHT}, DISPLAY={os.environ.get('DISPLAY')})."
+            font = pygame.font.SysFont(None, 72)
+            connecting_text = font.render("Connecting", True, CONNECTING_TEXT_COLOR)
+            connecting_rect = connecting_text.get_rect(
+                center=(DISPLAY_WIDTH // 2, DISPLAY_HEIGHT // 2)
             )
 
-            clock = pygame.time.Clock()
             while not self._stop_event.is_set() and self._display_active:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
@@ -459,7 +443,6 @@ class CameraManager:
                         self._display_active = False
 
                 assert self._pygame_screen is not None
-                self._pygame_screen.fill((0, 0, 0))
 
                 with self._frame_lock:
                     frame = self._pending_frame
@@ -470,21 +453,19 @@ class CameraManager:
                             frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT)
                         )
                     self._pygame_screen.blit(frame, (0, 0))
+                else:
+                    self._pygame_screen.fill(CREAM_COLOR)
+                    self._pygame_screen.blit(connecting_text, connecting_rect)
 
                 pygame.display.flip()
-                clock.tick(30)
+                time.sleep(0.1)
         except Exception as exc:
             print(f"Lucy Pi: incoming video display error — {exc}")
         finally:
-            try:
-                pygame.display.quit()
-                pygame.quit()
-            except Exception:
-                pass
             self._pygame_screen = None
             self._display_active = False
             self._display_ready.clear()
-            print("Lucy Pi: pygame display closed.")
+            print("Lucy Pi: pygame display loop stopped.")
 
     def _stop_incoming_video_display(self) -> None:
         self._display_active = False
@@ -494,6 +475,14 @@ class CameraManager:
         self._display_ready.clear()
         with self._frame_lock:
             self._pending_frame = None
+        try:
+            import pygame
+
+            pygame.quit()
+        except Exception:
+            pass
+        self._pygame_screen = None
+        print("Lucy Pi: pygame display closed.")
 
     def _start_picamera(self) -> None:
         picam = Picamera2()
@@ -539,7 +528,7 @@ class CameraManager:
                 channels=MIC_CHANNELS,
                 dtype="int16",
                 blocksize=block_frames,
-                device=self._respeaker_device,
+                device=None,
             ) as stream:
                 while not self._stop_event.is_set():
                     data, _overflowed = stream.read(block_frames)
