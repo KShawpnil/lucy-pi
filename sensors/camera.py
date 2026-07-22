@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import os
-import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import numpy as np
 import sounddevice as sd
@@ -16,46 +13,15 @@ from dotenv import load_dotenv
 from daily import CallClient, Daily, EventHandler
 from picamera2 import Picamera2
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-DAILY_API_KEY = (os.getenv("DAILY_API_KEY") or "").strip()
-
-# Picamera2 / Daily virtual camera
 CAMERA_DEVICE_NAME = "lucy-picamera"
 VIDEO_WIDTH = 1280
 VIDEO_HEIGHT = 720
 VIDEO_FPS = 30
 VIDEO_COLOR_FORMAT = "RGB"
-
-# Daily virtual microphone (fed from reSpeaker via sounddevice)
-MIC_DEVICE_NAME = "lucy-respeaker"
-MIC_SAMPLE_RATE = 16000  # reSpeaker XVF3800 native rate
-MIC_SAMPLE_RATE_FALLBACKS = (16000, 44100, 48000)
+MIC_SAMPLE_RATE = 16000
 MIC_CHANNELS = 1
-MIC_BLOCK_MS = 20
-
-# reSpeaker XVF3800 — matched against PortAudio device names on the Pi
-RESPEAKER_NAME_HINTS = ("xvf3800", "respeaker", "seeed")
-
-_daily_initialized = False
-
-
-def _ensure_daily_init() -> None:
-    global _daily_initialized
-    if not _daily_initialized:
-        Daily.init()
-        _daily_initialized = True
-
-
-def _default_output_device() -> int | None:
-    """Return the system default output device (InnoMaker HAT when set as default)."""
-    try:
-        devices = sd.default.device
-        output = devices[1] if isinstance(devices, (list, tuple)) else devices
-        return int(output) if int(output) >= 0 else None
-    except (TypeError, ValueError, IndexError):
-        return None
 
 
 def _participant_id(participant: Any) -> str | None:
@@ -78,120 +44,156 @@ def _is_local_participant(participant: Any) -> bool:
     return bool(getattr(participant, "local", False))
 
 
-def _is_valid_remote_participant_id(participant_id: str | None, info: Any = None) -> bool:
-    """Daily session IDs only — never 'local', '*', or empty strings."""
-    if not participant_id:
-        return False
-    pid = str(participant_id).strip()
-    if not pid or pid.lower() in ("local", "*"):
-        return False
-    if isinstance(info, dict) and info.get("local"):
-        return False
-    return True
+def _stream_picamera_frames(
+    picamera: Picamera2,
+    virtual_camera: Any,
+    stop_event: threading.Event,
+) -> None:
+    frame_interval = 1.0 / VIDEO_FPS
+    while not stop_event.is_set():
+        try:
+            frame = picamera.capture_array()
+            virtual_camera.write_frame(frame.tobytes())
+        except Exception as exc:
+            print(f"Lucy Pi: video frame error — {exc}")
+            break
+        time.sleep(frame_interval)
+
+
+def _attach_remote_audio(
+    client: CallClient | None,
+    participant_id: str,
+    on_remote_audio: Any,
+    attached: set[str],
+) -> None:
+    if client is None or participant_id in attached:
+        return
+
+    try:
+        client.set_audio_renderer(
+            participant_id,
+            on_remote_audio,
+            audio_source="microphone",
+            sample_rate=MIC_SAMPLE_RATE,
+        )
+        attached.add(participant_id)
+        print(f"Lucy Pi: receiving audio from participant {participant_id}.")
+    except Exception as exc:
+        print(
+            f"Lucy Pi: could not attach audio renderer for "
+            f"participant {participant_id} — {exc}"
+        )
+
+
+def _register_remote_participants(
+    client: CallClient,
+    on_remote_audio: Any,
+    attached: set[str],
+) -> None:
+    try:
+        participants = client.participants()
+    except Exception as exc:
+        print(f"Lucy Pi: could not list participants — {exc}")
+        return
+
+    for participant_key, info in participants.items():
+        if isinstance(info, dict) and info.get("local"):
+            continue
+
+        remote_id = _participant_id(info) if isinstance(info, dict) else None
+        candidate = remote_id or (
+            str(participant_key)
+            if participant_key and str(participant_key).lower() not in ("local", "*")
+            else None
+        )
+        if candidate:
+            _attach_remote_audio(client, candidate, on_remote_audio, attached)
 
 
 class _CallEventHandler(EventHandler):
-    """Handle remote participants joining — attach audio and incoming video."""
+    """Print when remote participants join and route their audio to the HAT."""
 
-    def __init__(self, manager: "CameraManager") -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._manager = manager
+        self.client: CallClient | None = None
+        self.on_remote_audio: Any = None
+        self.attached: set[str] = set()
 
     def on_participant_joined(self, participant: Any) -> None:
         if _is_local_participant(participant):
-            session_id = _participant_id(participant)
-            if session_id and session_id.lower() not in ("local", "*"):
-                self._manager._local_participant_id = session_id
-            print("Lucy Pi: local participant joined Daily room.")
             return
 
         participant_id = _participant_id(participant)
-        if not _is_valid_remote_participant_id(participant_id, participant):
-            print(f"Lucy Pi: ignored participant join (invalid id={participant_id!r}).")
+        if not participant_id:
             return
 
         print(f"Lucy Pi: remote participant joined — session_id={participant_id}")
-        self._manager._on_remote_participant_joined(str(participant_id))
-
-    def on_participant_updated(self, participant: Any) -> None:
-        if _is_local_participant(participant):
-            return
-        participant_id = _participant_id(participant)
-        if _is_valid_remote_participant_id(participant_id, participant):
-            self._manager._on_remote_participant_joined(str(participant_id))
+        _attach_remote_audio(
+            self.client,
+            str(participant_id),
+            self.on_remote_audio,
+            self.attached,
+        )
 
 
 class CameraManager:
-    """Manage Daily video calls with Picamera2 video and USB/HAT audio."""
+    """Join and leave Daily video calls using Picamera2 and system audio devices."""
 
     def __init__(self) -> None:
         self.is_call_active = False
-        self.current_call_client: CallClient | None = None
-        self.daily_api_key = DAILY_API_KEY
-
-        self._picamera: Picamera2 | None = None
-        self._virtual_camera: Any = None
-        self._virtual_microphone: Any = None
-        self._stop_event = threading.Event()
-        self._video_thread: threading.Thread | None = None
-        self._mic_thread: threading.Thread | None = None
-        self._output_stream: sd.OutputStream | None = None
-        self._respeaker_device: int | None = None
-        self._output_device: int | None = None
-        self._mic_sample_rate: int = MIC_SAMPLE_RATE
-        self._local_participant_id: str | None = None
-        self._audio_renderer_participants: set[str] = set()
-        self._on_remote_audio: Any = None
-        self.browser_process: subprocess.Popen | None = None
-
-    def _resolve_mic_sample_rate(self) -> int:
-        """Pick the first supported input sample rate on the system default mic."""
-        last_error: Exception | None = None
-        for rate in MIC_SAMPLE_RATE_FALLBACKS:
-            try:
-                sd.check_input_settings(
-                    device=None,
-                    samplerate=rate,
-                    channels=MIC_CHANNELS,
-                )
-                if rate != MIC_SAMPLE_RATE:
-                    print(
-                        f"Lucy Pi: mic using fallback sample rate {rate} Hz "
-                        f"({MIC_SAMPLE_RATE} Hz unavailable)."
-                    )
-                return rate
-            except Exception as exc:
-                last_error = exc
-                print(f"Lucy Pi: mic sample rate {rate} Hz failed — {exc}")
-        raise RuntimeError(
-            "Could not configure system default microphone at 16000, 44100, or 48000 Hz"
-        ) from last_error
+        self.current_call_client = None
+        self.browser_process = None
 
     def join_video_call(self, room_url: str) -> None:
         if self.is_call_active:
             raise RuntimeError("A video call is already active. Leave it before joining another.")
 
-        os.environ["DISPLAY"] = ":0"
+        print("Lucy Pi: joining the call.")
 
-        time.sleep(5)
+        Daily.init()
 
-        _ensure_daily_init()
+        picamera = Picamera2()
+        config = picamera.create_video_configuration(
+            main={"size": (VIDEO_WIDTH, VIDEO_HEIGHT), "format": "RGB888"}
+        )
+        picamera.configure(config)
+        picamera.start()
 
-        self._output_device = _default_output_device()
-        self._mic_sample_rate = MIC_SAMPLE_RATE
-
-        self._start_picamera()
-        self._virtual_camera = Daily.create_camera_device(
+        virtual_camera = Daily.create_camera_device(
             CAMERA_DEVICE_NAME,
             width=VIDEO_WIDTH,
             height=VIDEO_HEIGHT,
             color_format=VIDEO_COLOR_FORMAT,
         )
 
-        self._stop_event.clear()
-        self._start_remote_audio_playback()
+        stop_event = threading.Event()
+        attached_participants: set[str] = set()
 
-        client = CallClient(event_handler=_CallEventHandler(self))
+        output_stream = sd.OutputStream(
+            samplerate=MIC_SAMPLE_RATE,
+            channels=MIC_CHANNELS,
+            dtype="int16",
+            device=None,
+        )
+        output_stream.start()
+
+        def on_remote_audio(participant_id: str, audio_data: Any, audio_source: str) -> None:
+            if stop_event.is_set():
+                return
+            try:
+                samples = np.frombuffer(audio_data.audio_frames, dtype=np.int16)
+                if audio_data.num_channels > 1:
+                    samples = samples.reshape(-1, audio_data.num_channels)
+                output_stream.write(samples)
+            except Exception as exc:
+                print(f"Lucy Pi: remote audio playback error — {exc}")
+
+        event_handler = _CallEventHandler()
+        event_handler.on_remote_audio = on_remote_audio
+        event_handler.attached = attached_participants
+
+        client = CallClient(event_handler=event_handler)
+        event_handler.client = client
         self.current_call_client = client
 
         client.join(
@@ -213,47 +215,37 @@ class CameraManager:
             },
         )
 
-        self._register_existing_remote_participants(client)
+        _register_remote_participants(client, on_remote_audio, attached_participants)
 
-        self._video_thread = threading.Thread(
-            target=self._stream_picamera_frames,
+        video_thread = threading.Thread(
+            target=_stream_picamera_frames,
+            args=(picamera, virtual_camera, stop_event),
             name="lucy-video-stream",
             daemon=True,
         )
-        self._video_thread.start()
+        video_thread.start()
 
-        self._open_chromium_kiosk(room_url)
+        self._stop_event = stop_event
+        self._picamera = picamera
+        self._virtual_camera = virtual_camera
+        self._output_stream = output_stream
+        self._video_thread = video_thread
 
         self.is_call_active = True
-        try:
-            default_input = sd.query_devices(kind="input")
-            mic_label = default_input.get("name", "system default input")
-        except Exception:
-            mic_label = "system default input"
-        out_label = (
-            sd.query_devices(self._output_device)["name"]
-            if self._output_device is not None
-            else "system default output"
-        )
-        print(
-            f"Lucy Pi: joined video call at {room_url}\n"
-            f"  Video: Picamera2 → {CAMERA_DEVICE_NAME} ({VIDEO_WIDTH}x{VIDEO_HEIGHT})\n"
-            f"  Audio in: {mic_label} @ {self._mic_sample_rate} Hz\n"
-            f"  Audio out: {out_label}\n"
-            f"  Display: Chromium kiosk on Pi monitor (DISPLAY={os.environ.get('DISPLAY', ':0')})"
-        )
+        print(f"Lucy Pi: joined the call successfully — {room_url}")
 
     def leave_video_call(self) -> None:
-        if not self.is_call_active and self.current_call_client is None:
+        if not self.is_call_active:
             print("Lucy Pi: no active video call to leave.")
             return
 
-        self._stop_event.set()
+        if hasattr(self, "_stop_event"):
+            self._stop_event.set()
 
-        if self._video_thread and self._video_thread.is_alive():
-            self._video_thread.join(timeout=2.0)
-
-        self._video_thread = None
+        if hasattr(self, "_video_thread") and self._video_thread is not None:
+            if self._video_thread.is_alive():
+                self._video_thread.join(timeout=2.0)
+            self._video_thread = None
 
         if self.current_call_client is not None:
             try:
@@ -261,197 +253,29 @@ class CameraManager:
             except Exception as exc:
                 print(f"Lucy Pi: warning while leaving call — {exc}")
 
-        self._stop_picamera()
-        self._stop_remote_audio_playback()
-        self._close_chromium_kiosk()
+        if hasattr(self, "_picamera") and self._picamera is not None:
+            try:
+                self._picamera.stop()
+                self._picamera.close()
+            except Exception as exc:
+                print(f"Lucy Pi: warning while stopping Picamera2 — {exc}")
+            self._picamera = None
 
+        if hasattr(self, "_output_stream") and self._output_stream is not None:
+            try:
+                self._output_stream.stop()
+                self._output_stream.close()
+            except Exception as exc:
+                print(f"Lucy Pi: warning while stopping audio output — {exc}")
+            self._output_stream = None
+
+        self._virtual_camera = None
         self.is_call_active = False
         self.current_call_client = None
-        self._virtual_camera = None
-        self._virtual_microphone = None
-        self._local_participant_id = None
-        self._audio_renderer_participants.clear()
-        self._on_remote_audio = None
-
-        print("Lucy Pi: video call ended cleanly.")
+        print("Lucy Pi: left the call cleanly.")
 
     def is_active(self) -> bool:
         return self.is_call_active
-
-    def _on_remote_participant_joined(self, participant_id: str) -> None:
-        """Subscribe to remote participant audio."""
-        self._attach_remote_audio_renderer(participant_id)
-
-    def _open_chromium_kiosk(self, room_url: str) -> None:
-        """Open the Daily room in fullscreen Chromium on the Pi monitor."""
-        os.environ["DISPLAY"] = ":0"
-        parsed = urlparse(room_url)
-        daily_origin = f"{parsed.scheme}://{parsed.netloc}"
-        self.browser_process = subprocess.Popen(
-            [
-                "chromium-browser",
-                "--kiosk",
-                "--no-sandbox",
-                "--disable-infobars",
-                "--autoplay-policy=no-user-gesture-required",
-                "--use-fake-ui-for-media-stream",
-                "--allow-running-insecure-content",
-                f"--unsafely-treat-insecure-origin-as-secure={daily_origin}",
-                "--enable-usermedia-screen-capturing",
-                "--auto-accept-camera-and-microphone-capture",
-                "--disable-web-security",
-                room_url,
-            ]
-        )
-        print(f"Lucy Pi: Chromium kiosk opened for {room_url}")
-
-    def _close_chromium_kiosk(self) -> None:
-        if self.browser_process is not None:
-            try:
-                self.browser_process.terminate()
-            except Exception as exc:
-                print(f"Lucy Pi: warning while closing Chromium — {exc}")
-            self.browser_process = None
-            print("Lucy Pi: Chromium kiosk closed.")
-
-    def _start_picamera(self) -> None:
-        picam = Picamera2()
-        config = picam.create_video_configuration(
-            main={"size": (VIDEO_WIDTH, VIDEO_HEIGHT), "format": "RGB888"}
-        )
-        picam.configure(config)
-        picam.start()
-        self._picamera = picam
-
-    def _stop_picamera(self) -> None:
-        if self._picamera is None:
-            return
-        try:
-            self._picamera.stop()
-            self._picamera.close()
-        except Exception as exc:
-            print(f"Lucy Pi: warning while stopping Picamera2 — {exc}")
-        finally:
-            self._picamera = None
-
-    def _stream_picamera_frames(self) -> None:
-        frame_interval = 1.0 / VIDEO_FPS
-        while not self._stop_event.is_set():
-            if self._picamera is None or self._virtual_camera is None:
-                break
-            try:
-                frame = self._picamera.capture_array()
-                self._virtual_camera.write_frame(frame.tobytes())
-            except Exception as exc:
-                print(f"Lucy Pi: video frame error — {exc}")
-                break
-            time.sleep(frame_interval)
-
-    def _stream_respeaker_audio(self) -> None:
-        block_frames = int(self._mic_sample_rate * MIC_BLOCK_MS / 1000)
-        if self._virtual_microphone is None:
-            return
-
-        try:
-            with sd.RawInputStream(
-                samplerate=self._mic_sample_rate,
-                channels=MIC_CHANNELS,
-                dtype="int16",
-                blocksize=block_frames,
-                device=None,
-            ) as stream:
-                while not self._stop_event.is_set():
-                    data, _overflowed = stream.read(block_frames)
-                    self._virtual_microphone.write_frames(bytes(data))
-        except Exception as exc:
-            if not self._stop_event.is_set():
-                print(f"Lucy Pi: microphone stream error — {exc}")
-
-    def _register_existing_remote_participants(self, client: CallClient) -> None:
-        """Attach audio/video for remote participants already in the room."""
-        try:
-            participants = client.participants()
-        except Exception as exc:
-            print(f"Lucy Pi: could not list participants — {exc}")
-            return
-
-        for participant_key, info in participants.items():
-            if isinstance(info, dict) and info.get("local"):
-                session_id = _participant_id(info)
-                if session_id and session_id.lower() not in ("local", "*"):
-                    self._local_participant_id = session_id
-                continue
-
-            remote_id = _participant_id(info) if isinstance(info, dict) else None
-            candidate = remote_id if _is_valid_remote_participant_id(remote_id, info) else None
-            if candidate is None and _is_valid_remote_participant_id(participant_key, info):
-                candidate = str(participant_key)
-            if candidate:
-                self._on_remote_participant_joined(candidate)
-
-    def _attach_remote_audio_renderer(self, participant_id: str) -> None:
-        """Register Daily audio output for one remote participant session ID."""
-        if not _is_valid_remote_participant_id(participant_id):
-            return
-        if (
-            self.current_call_client is None
-            or participant_id in self._audio_renderer_participants
-            or participant_id == self._local_participant_id
-            or self._on_remote_audio is None
-        ):
-            return
-
-        try:
-            self.current_call_client.set_audio_renderer(
-                participant_id,
-                self._on_remote_audio,
-                audio_source="microphone",
-                sample_rate=self._mic_sample_rate,
-            )
-            self._audio_renderer_participants.add(participant_id)
-            print(f"Lucy Pi: receiving audio from participant {participant_id}.")
-        except Exception as exc:
-            print(
-                f"Lucy Pi: could not attach audio renderer for "
-                f"participant {participant_id} — {exc}"
-            )
-
-    def _start_remote_audio_playback(self) -> None:
-        """Prepare speaker output; renderers are attached per remote participant ID."""
-
-        def on_remote_audio(
-            participant_id: str, audio_data: Any, audio_source: str
-        ) -> None:
-            if self._stop_event.is_set() or self._output_stream is None:
-                return
-            try:
-                samples = np.frombuffer(audio_data.audio_frames, dtype=np.int16)
-                if audio_data.num_channels > 1:
-                    samples = samples.reshape(-1, audio_data.num_channels)
-                self._output_stream.write(samples)
-            except Exception as exc:
-                print(f"Lucy Pi: remote audio playback error — {exc}")
-
-        self._on_remote_audio = on_remote_audio
-
-        self._output_stream = sd.OutputStream(
-            samplerate=self._mic_sample_rate,
-            channels=MIC_CHANNELS,
-            dtype="int16",
-            device=self._output_device,
-        )
-        self._output_stream.start()
-
-    def _stop_remote_audio_playback(self) -> None:
-        if self._output_stream is None:
-            return
-        try:
-            self._output_stream.stop()
-            self._output_stream.close()
-        except Exception as exc:
-            print(f"Lucy Pi: warning while stopping audio output — {exc}")
-        finally:
-            self._output_stream = None
 
 
 camera = CameraManager()
