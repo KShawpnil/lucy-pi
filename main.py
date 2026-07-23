@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -190,6 +191,13 @@ def handle_wake_word_detected() -> None:
 
 
 def startup() -> None:
+    subprocess.run(
+        ["pactl", "set-default-sink", "alsa_output.platform-soc_107c000000_sound.stereo-fallback.2"],
+        check=False,
+    )
+    subprocess.run(["pactl", "set-sink-volume", "111", "100%"], check=False)
+    subprocess.run(["pactl", "set-sink-mute", "111", "false"], check=False)
+
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"Lucy Pi: starting up at {now}.")
 
