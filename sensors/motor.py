@@ -2,7 +2,7 @@ import time
 
 from gpiozero import Servo
 
-SERVO_PIN = 25
+SERVO_PIN = 18
 MIN_PULSE_WIDTH = 0.0005
 MAX_PULSE_WIDTH = 0.0025
 
